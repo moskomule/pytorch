@@ -5,6 +5,7 @@ from collections import OrderedDict
 import torch.sparse as sparse
 import torch.utils.hooks as hooks
 import warnings
+import weakref
 
 
 class Variable(_C._VariableBase):
@@ -56,6 +57,7 @@ class Variable(_C._VariableBase):
         'dim',
         'get_device',
         'is_cuda',
+        'shape'
     }
 
     def __getattr__(self, name):
@@ -128,7 +130,7 @@ class Variable(_C._VariableBase):
 
         The graph is differentiated using the chain rule. If the variable is
         non-scalar (i.e. its data has more than one element) and requires
-        gradient, the function additionaly requires specifying ``gradient``.
+        gradient, the function additionally requires specifying ``gradient``.
         It should be a tensor of matching type and location, that contains
         the gradient of the differentiated function w.r.t. ``self``.
 
@@ -230,6 +232,28 @@ class Variable(_C._VariableBase):
         """
         self._grad_fn = None
         self.requires_grad = False
+
+    def retain_grad(self):
+        """Enables .grad attribute for non-leaf Variables."""
+        if self.grad_fn is None:  # no-op for leaves
+            return
+        if not self.requires_grad:
+            raise RuntimeError("can't retain_grad on Variable that has requires_grad=False")
+        if hasattr(self, 'retains_grad'):
+            return
+        weak_self = weakref.ref(self)
+
+        def retain_grad_hook(grad):
+            var = weak_self()
+            if var is None:
+                return
+            if var._grad is None:
+                var._grad = grad.clone()
+            else:
+                var._grad = var._grad + grad
+
+        self.register_hook(retain_grad_hook)
+        self.retains_grad = True
 
     def contiguous(self):
         self.data = self.data.contiguous()

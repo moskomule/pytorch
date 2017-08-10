@@ -285,6 +285,7 @@ tests = [
     ('qr', small_2d_lapack_skinny, lambda t: [], 'skinny', float_types),
     ('qr', small_2d_lapack_fat, lambda t: [], 'fat', float_types),
     ('qr', large_2d_lapack, lambda t: [], 'big', float_types),
+    ('inverse', new_t(20, 20), lambda t: [], None, float_types),
 
 ]
 
@@ -299,7 +300,7 @@ custom_precision = {
     'baddbmm': 1e-4,
     'rsqrt': 1e-4,
     'cumprod': 1e-4,
-    'qr': 1e-4,
+    'qr': 3e-4,
 }
 
 simple_pointwise = [
