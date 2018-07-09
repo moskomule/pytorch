@@ -9,7 +9,7 @@
 #include "gloo/allreduce_ring.h"
 #include "gloo/barrier_all_to_all.h"
 #include "gloo/broadcast_one_to_all.h"
-#ifdef WITH_CUDA
+#ifdef USE_CUDA
 #include "gloo/cuda_allreduce_ring.h"
 #include "gloo/cuda_allreduce_halving_doubling.h"
 #include "gloo/cuda_allreduce_halving_doubling_pipelined.h"
@@ -19,7 +19,7 @@
 #include "gloo/rendezvous/store.h"
 #include "gloo/rendezvous/prefix_store.h"
 
-#ifdef WITH_CUDA
+#ifdef USE_CUDA
 #include <cuda.h>
 #include <THC/THC.h>
 #endif
@@ -37,8 +37,8 @@ using key_type = std::tuple<
   THDGroup,       // group
   DeviceType,     // tensors device type
   int,            // CUDA stream id used in the algorithm
-  std::size_t,    // input buffer bytes
-  std::size_t,    // output buffer bytes
+  size_t,    // input buffer bytes
+  size_t,    // output buffer bytes
   THDReduceOp,    // reduce op
   rank_type       // src/dest rank
 >;
@@ -47,7 +47,7 @@ const DeviceType UNUSED_DEVICE = DeviceType::LAST;
 const THDReduceOp UNUSED_OP = THDReduceMIN;
 const int UNUSED_STREAM = -1;
 const rank_type UNUSED_RANK = -1;
-const std::size_t UNUSED_BYTES = 0;
+const size_t UNUSED_BYTES = 0;
 
 // Forward declaration
 template<CollectiveType D, typename T>
@@ -81,9 +81,10 @@ struct GlooCache {
     std::shared_ptr<std::mutex>      // mutex to protect same algorithm from running concurrently
   >;
 
-  GlooCache(rank_type rank, std::shared_ptr<::gloo::transport::Device> device)
+  GlooCache(rank_type rank,
+            std::vector<std::shared_ptr<::gloo::transport::Device>> deviceList)
    : _rank(rank)
-   , _device(device)
+   , _deviceList(deviceList)
   {}
 
   GlooCache(GlooCache const&)      = delete;
@@ -113,19 +114,34 @@ struct GlooCache {
     const DataChannelGloo::Group& group,
     const std::string& prefix
   ) {
+    /**
+     * We currently only supports a single Infiniband interface. In other words,
+     * if there are multiple Infiniband devices in the system, Gloo will detect
+     * all of them and use the first device.
+     *
+     * TODO: This can be extended later to utilize multiple Infiniband devices
+     *
+     * For ethernet, _deviceList[0] will always have the default ethernet
+     * device that is detected from the user's provided IP address and there
+     * won't be multiple one device in _deviceList
+     *
+     * For Infiniband, _deviceList[0], which is the first found IB interfance,
+     * will be used by all Gloo operations.
+     */
+    size_t curDevice = 0;
     auto context = std::make_shared<context_type>(
         group.mustGetGroupRank(_rank), group.size());
     prefix_store_type prefix_store(prefix, *group._store);
-    context->connectFullMesh(prefix_store, _device);
+    context->connectFullMesh(prefix_store, _deviceList[curDevice]);
     return context;
   }
 
   // NOTE: this function needs to be thread safe
-  std::shared_ptr<buffer_type> createBuffer(std::size_t bytes, DeviceType device) const {
+  std::shared_ptr<buffer_type> createBuffer(size_t bytes, DeviceType device) const {
     if (device == DeviceType::CPU) {
       return std::shared_ptr<buffer_type>(new char[bytes],
                                           std::default_delete<char[]>());
-#ifdef WITH_CUDA
+#ifdef USE_CUDA
     } else if (device == DeviceType::CUDA) {
       buffer_type *buf;
       THCudaCheck(THCudaMalloc(THDGetCudaState(), (void**)&buf, bytes));
@@ -161,17 +177,17 @@ struct GlooCache {
     return it->second;
   }
 
-  static void memcpy_input(value_type& info, thpp::Tensor& t) {
-    std::uint64_t tensor_bytes = t.elementSize() * t.numel();
+  static void memcpy_input(value_type& info, at::Tensor& t) {
+    uint64_t tensor_bytes = t.type().elementSizeInBytes() * t.numel();
     auto t_dev = getDeviceType(t);
     auto input_buffer = GlooCache::input_buffer(info).get();
 
     if (t_dev == DeviceType::CPU) {
-      std::memcpy(input_buffer, t.data(), tensor_bytes);
-#ifdef WITH_CUDA
+      std::memcpy(input_buffer, t.data_ptr(), tensor_bytes);
+#ifdef USE_CUDA
     } else if (t_dev == DeviceType::CUDA) {
       auto stream = THCState_getCurrentStream(THDGetCudaState());
-      THCudaCheck(cudaMemcpyAsync(input_buffer, t.data(), tensor_bytes,
+      THCudaCheck(cudaMemcpyAsync(input_buffer, t.data_ptr(), tensor_bytes,
                                   cudaMemcpyDeviceToDevice, stream));
 #endif
     } else {
@@ -179,17 +195,17 @@ struct GlooCache {
     }
   }
 
-  static void memcpy_output(value_type& info, thpp::Tensor& t) {
-    std::uint64_t tensor_bytes = t.elementSize() * t.numel();
+  static void memcpy_output(value_type& info, at::Tensor& t) {
+    uint64_t tensor_bytes = t.type().elementSizeInBytes() * t.numel();
     auto t_dev = getDeviceType(t);
     auto output_buffer = GlooCache::output_buffer(info).get();
 
     if (t_dev == DeviceType::CPU) {
-      std::memcpy(t.data(), output_buffer, tensor_bytes);
-#ifdef WITH_CUDA
+      std::memcpy(t.data_ptr(), output_buffer, tensor_bytes);
+#ifdef USE_CUDA
     } else if (t_dev == DeviceType::CUDA) {
       auto stream = THCState_getCurrentStream(THDGetCudaState());
-      THCudaCheck(cudaMemcpyAsync(t.data(), output_buffer, tensor_bytes,
+      THCudaCheck(cudaMemcpyAsync(t.data_ptr(), output_buffer, tensor_bytes,
                                   cudaMemcpyDeviceToDevice, stream));
 #endif
     } else {
@@ -210,7 +226,7 @@ private:
   }
 
   rank_type _rank;
-  std::shared_ptr<::gloo::transport::Device> _device;
+  std::vector<std::shared_ptr<::gloo::transport::Device>> _deviceList;
   std::shared_ptr<store_type> _store;
 
   std::mutex _mutex;
@@ -239,7 +255,7 @@ const ::gloo::ReductionFunction<T>* THDToGlooReduceOp(THDReduceOp op) {
 template<typename T>
 struct algorithm_spec<CollectiveType::ALL_GATHER, T> {
   static GlooCache::key_type key(
-    THDGroup group_id, DeviceType device, std::size_t input_bytes, std::size_t output_bytes, std::size_t unused_count
+    THDGroup group_id, DeviceType device, size_t input_bytes, size_t output_bytes, size_t unused_count
   ) {
     return std::make_tuple(CollectiveType::ALL_GATHER, group_id, device, UNUSED_STREAM,
                            input_bytes, output_bytes, UNUSED_OP, UNUSED_RANK);
@@ -247,7 +263,7 @@ struct algorithm_spec<CollectiveType::ALL_GATHER, T> {
 
   static GlooCache::value_type create(GlooCache& cache,
     const DataChannelGloo::Group& group, const std::string& store_prefix,
-    DeviceType device, std::size_t input_bytes, std::size_t output_bytes, std::size_t count
+    DeviceType device, size_t input_bytes, size_t output_bytes, size_t count
   ) {
     auto context = cache.createContext(group, store_prefix);
     auto input_buffer = cache.createBuffer(input_bytes, device);
@@ -257,7 +273,7 @@ struct algorithm_spec<CollectiveType::ALL_GATHER, T> {
     if (device == DeviceType::CPU) {
       algo = std::make_shared<::gloo::AllgatherRing<T>>(
         context,
-        std::initializer_list<T*>{reinterpret_cast<T*>(input_buffer.get())},
+        std::initializer_list<const T*>{reinterpret_cast<const T*>(input_buffer.get())},
         reinterpret_cast<T*>(output_buffer.get()),
         count);
     } else {
@@ -276,8 +292,8 @@ struct algorithm_spec<CollectiveType::ALL_GATHER, T> {
 template<typename T>
 struct algorithm_spec<CollectiveType::ALL_REDUCE, T> {
   static GlooCache::key_type key(
-    THDGroup group_id, DeviceType device, std::size_t input_bytes,
-    std::size_t unused_count, THDReduceOp op
+    THDGroup group_id, DeviceType device, size_t input_bytes,
+    size_t unused_count, THDReduceOp op
   ) {
     int stream = UNUSED_STREAM;
     if (device == DeviceType::CUDA) {
@@ -290,7 +306,7 @@ struct algorithm_spec<CollectiveType::ALL_REDUCE, T> {
 
   static GlooCache::value_type create(GlooCache& cache,
     const DataChannelGloo::Group& group, const std::string& store_prefix,
-    DeviceType device, std::size_t input_bytes, std::size_t count, THDReduceOp op
+    DeviceType device, size_t input_bytes, size_t count, THDReduceOp op
   ) {
     auto context = cache.createContext(group, store_prefix);
     auto input_buffer = cache.createBuffer(input_bytes, device);
@@ -302,18 +318,34 @@ struct algorithm_spec<CollectiveType::ALL_REDUCE, T> {
         std::initializer_list<T*>{reinterpret_cast<T*>(input_buffer.get())},
         count,
         THDToGlooReduceOp<T>(op));
-#ifdef WITH_CUDA
+#ifdef USE_CUDA
     } else if (device == DeviceType::CUDA) {
       if (op != THDReduceSUM) {
         throw std::runtime_error("Gloo backend only supports sum op for CUDA all reduce");
       }
       auto stream = THCState_getCurrentStream(THDGetCudaState());
-      algo = std::make_shared<::gloo::CudaAllreduceHalvingDoublingPipelined<T>>(
-        context,
-        std::initializer_list<T*>{reinterpret_cast<T*>(input_buffer.get())},
-        count,
-        std::vector<cudaStream_t>{stream});
+
+#if defined(USE_GLOO_IBVERBS) && USE_GLOO_IBVERBS
+      // Only enable GPU direct if the device supports it
+      if (context->getDevice()->hasGPUDirect()) {
+        algo = std::make_shared<::gloo::CudaAllreduceHalvingDoublingPipelined<T,
+                                ::gloo::CudaDeviceWorkspace<T>>>(
+          context,
+          std::initializer_list<T*>{reinterpret_cast<T*>(input_buffer.get())},
+          count,
+          std::vector<cudaStream_t>{stream});
+      } else
 #endif
+      {
+        algo = std::make_shared<::gloo::CudaAllreduceHalvingDoublingPipelined<T,
+                                ::gloo::CudaHostWorkspace<T>>>(
+          context,
+          std::initializer_list<T*>{reinterpret_cast<T*>(input_buffer.get())},
+          count,
+          std::vector<cudaStream_t>{stream});
+      }
+#endif
+
     } else {
       throw std::runtime_error("unsupported tensor device in Gloo allReduce");
     }
@@ -330,8 +362,8 @@ struct algorithm_spec<CollectiveType::ALL_REDUCE, T> {
 template<typename T>
 struct algorithm_spec<CollectiveType::BROADCAST, T> {
   static GlooCache::key_type key(
-    THDGroup group_id, DeviceType device, std::size_t input_bytes,
-    std::size_t unused_count, rank_type src_rank
+    THDGroup group_id, DeviceType device, size_t input_bytes,
+    size_t unused_count, rank_type src_rank
   ) {
     int stream = UNUSED_STREAM;
     if (device == DeviceType::CUDA) {
@@ -344,7 +376,7 @@ struct algorithm_spec<CollectiveType::BROADCAST, T> {
 
   static GlooCache::value_type create(GlooCache& cache,
     const DataChannelGloo::Group& group, const std::string& store_prefix,
-    DeviceType device, std::size_t input_bytes, std::size_t count, rank_type src_rank
+    DeviceType device, size_t input_bytes, size_t count, rank_type src_rank
   ) {
     auto context = cache.createContext(group, store_prefix);
     auto input_buffer = cache.createBuffer(input_bytes, device);
@@ -356,17 +388,35 @@ struct algorithm_spec<CollectiveType::BROADCAST, T> {
         std::initializer_list<T*>{reinterpret_cast<T*>(input_buffer.get())},
         count,
         src_rank);
-#ifdef WITH_CUDA
+#ifdef USE_CUDA
     } else if (device == DeviceType::CUDA) {
       auto stream = THCState_getCurrentStream(THDGetCudaState());
-      algo = std::make_shared<::gloo::CudaBroadcastOneToAll<T>>(
-        context,
-        std::initializer_list<T*>{reinterpret_cast<T*>(input_buffer.get())},
-        count,
-        src_rank,
-        0,
-        std::vector<cudaStream_t>{stream});
+
+#if defined(USE_GLOO_IBVERBS) && USE_GLOO_IBVERBS
+      // Only enable GPU direct if the device supports it
+      if (context->getDevice()->hasGPUDirect()) {
+        algo = std::make_shared<::gloo::CudaBroadcastOneToAll<T,
+                                ::gloo::CudaDeviceWorkspace<T>>>(
+          context,
+          std::initializer_list<T*>{reinterpret_cast<T*>(input_buffer.get())},
+          count,
+          src_rank,
+          0,
+          std::vector<cudaStream_t>{stream});
+      } else
 #endif
+      {
+        algo = std::make_shared<::gloo::CudaBroadcastOneToAll<T,
+                                ::gloo::CudaHostWorkspace<T>>>(
+          context,
+          std::initializer_list<T*>{reinterpret_cast<T*>(input_buffer.get())},
+          count,
+          src_rank,
+          0,
+          std::vector<cudaStream_t>{stream});
+      }
+#endif
+
     } else {
       throw std::runtime_error("unsupported tensor device in Gloo broadcast");
     }

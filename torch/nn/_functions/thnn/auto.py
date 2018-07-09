@@ -3,20 +3,26 @@ from collections import defaultdict
 
 import torch
 from torch._thnn.utils import parse_header, THNN_H_PATH
-from torch.autograd import Variable
 from torch.autograd.function import Function, InplaceFunction, once_differentiable
 from torch._thnn import type2backend
 from .auto_double_backwards import double_backwards_fns
+from .auto_symbolic import symbolic_fns
 
 from . import _all_functions
 
 
 def _make_function_class_criterion(class_name, update_output, update_grad_input, acc_grad_parameters,
-                                   double_backwards_fn):
+                                   double_backwards_fn, symbolic_fn):
     weight_arg_idx = -1
     for i, arg in enumerate(update_output.arguments):
         if arg.name.startswith('weight'):
             weight_arg_idx = i
+            break
+
+    reduce_arg_idx = -1
+    for i, arg in enumerate(update_output.arguments):
+        if arg.name == 'reduce':
+            reduce_arg_idx = i
             break
 
     buffers_idx = []
@@ -27,8 +33,13 @@ def _make_function_class_criterion(class_name, update_output, update_grad_input,
         additional_arg_idx += 1
 
     @staticmethod
+    def symbolic(*args, **kwargs):
+        a = symbolic_fn(*args, **kwargs)
+        return a
+
+    @staticmethod
     def forward(ctx, input, target, *args):
-        ctx._backend = type2backend[type(input)]
+        ctx._backend = type2backend[input.type()]
         ctx.save_for_backward(input, target)
         if weight_arg_idx >= 0:
             ctx.weight = args[0]
@@ -49,7 +60,7 @@ def _make_function_class_criterion(class_name, update_output, update_grad_input,
 
     @staticmethod
     def backward(ctx, grad_output):
-        input, target = ctx.saved_variables
+        input, target = ctx.saved_tensors
         # apply returns grad_input, so we need to return Nones for target (1) + 1 for each extra arg passed to forward.
         return ((backward_cls.apply(input, target, grad_output, ctx.additional_args, ctx._backend),) +
                 (None,) * (ctx.forward_args_count + 1))
@@ -60,6 +71,12 @@ def _make_function_class_criterion(class_name, update_output, update_grad_input,
         ctx._backend = backend_ctx
         ctx.save_for_backward(input, target, grad_output)
         grad_input = grad_output.new().resize_as_(input).zero_()
+
+        if reduce_arg_idx >= 0:
+            getattr(ctx._backend, update_grad_input.name)(ctx._backend.library_state, input, target,
+                                                          grad_output, grad_input, *ctx.additional_args)
+            return grad_input
+
         getattr(ctx._backend, update_grad_input.name)(ctx._backend.library_state, input, target,
                                                       grad_input, *ctx.additional_args)
         grad_output_expanded = grad_output.view(*repeat(1, grad_input.dim()))
@@ -72,7 +89,7 @@ def _make_function_class_criterion(class_name, update_output, update_grad_input,
 
     backward_cls = type(class_name + "Backward", (Function,),
                         dict(forward=backward_cls_forward, backward=backward_cls_backward))
-    return type(class_name, (Function,), dict(forward=forward, backward=backward)), backward_cls
+    return type(class_name, (Function,), dict(forward=forward, backward=backward, symbolic=symbolic)), backward_cls
 
 
 def _find_buffers(args, ignored_args):
@@ -87,7 +104,8 @@ def _find_buffers(args, ignored_args):
     return buffers
 
 
-def _make_function_class(class_name, update_output, update_grad_input, acc_grad_parameters, double_backwards_fn):
+def _make_function_class(class_name, update_output, update_grad_input, acc_grad_parameters,
+                         double_backwards_fn, symbolic_fn):
     def has_argument(fn, name):
         for arg in fn.arguments:
             if arg.name == name:
@@ -122,13 +140,17 @@ def _make_function_class(class_name, update_output, update_grad_input, acc_grad_
         return tuple(additional_args)
 
     @staticmethod
+    def symbolic(*args, **kwargs):
+        return symbolic_fn(*args, **kwargs)
+
+    @staticmethod
     def forward(ctx, input, *params):
-        ctx._backend = type2backend[type(input)]
+        ctx._backend = type2backend[input.type()]
 
         ctx.additional_args = []
         tensor_param_list = []
         for param in params:
-            if torch.is_tensor(param):
+            if isinstance(param, torch.Tensor):
                 if type(param) != type(input):
                     raise RuntimeError("input type ({}) doesn't match the type of "
                                        "a parameter tensor ({})".format(torch.typename(input),
@@ -156,7 +178,7 @@ def _make_function_class(class_name, update_output, update_grad_input, acc_grad_
         args += tuple(additional_args)
 
         # If the module is working in-place its output will be set to the
-        # same storage as input, but its variable won't be dirty.
+        # same storage as input, but its tensor won't be dirty.
         if is_inplace and ctx.inplace:
             ctx.mark_dirty(input)
             output = input
@@ -176,7 +198,7 @@ def _make_function_class(class_name, update_output, update_grad_input, acc_grad_
 
     @staticmethod
     def backward(ctx, grad_output):
-        t = ctx.saved_variables
+        t = ctx.saved_tensors
         input, tensor_params = t[0], t[1:]
         # Some notes on this function call:
         # 1) We need to pass params as *params so they are unwrapped correctly in backward_cls_forward.
@@ -240,7 +262,7 @@ def _make_function_class(class_name, update_output, update_grad_input, acc_grad_
     backward_cls = type(class_name + "Backward", (base_class,), dict(forward=backward_cls_forward,
                                                                      backward=backward_cls_backward))
 
-    return type(class_name, (base_class,), dict(forward=forward, backward=backward)), backward_cls
+    return type(class_name, (base_class,), dict(forward=forward, backward=backward, symbolic=symbolic)), backward_cls
 
 
 def _generate_function_classes(scope_dict):
@@ -264,6 +286,8 @@ def _generate_function_classes(scope_dict):
         'VolumetricAveragePooling',
         'VolumetricMaxPooling',
         'VolumetricMaxUnpooling',
+        'VolumetricAdaptiveAveragePooling',
+        'VolumetricAdaptiveMaxPooling',
         'VolumetricConvolution',
         'VolumetricFullConvolution',
         'VolumetricConvolutionMM',
@@ -273,20 +297,22 @@ def _generate_function_classes(scope_dict):
         'LookupTableBag',
         'PReLU',
         'RReLU',
+        'SoftMax',
+        'LogSoftMax',
         'GRUFused',
         'LSTMFused',
         'unfolded',
     }
     name_remap = {
         'TemporalConvolution': 'Conv1d',
+        'TemporalReflectionPadding': 'ReflectionPad1d',
+        'TemporalReplicationPadding': 'ReplicationPad1d',
         'SpatialDilatedConvolution': 'DilatedConv2d',
         'SpatialMaxUnpooling': 'MaxUnpool2d',
         'SpatialReflectionPadding': 'ReflectionPad2d',
         'SpatialReplicationPadding': 'ReplicationPad2d',
         'VolumetricReplicationPadding': 'ReplicationPad3d',
         'VolumetricMaxUnpooling': 'MaxUnpool3d',
-        'SoftMax': 'Softmax',
-        'LogSoftMax': 'LogSoftmax',
         'HardTanh': 'Hardtanh',
         'HardShrink': 'Hardshrink',
         'SoftPlus': 'Softplus',
@@ -316,16 +342,17 @@ def _generate_function_classes(scope_dict):
                     raise ValueError(class_name + " can only be differentiated once.")
                 return default_double_backwards_fn
             double_backwards_fn = make_default_double_backwards_fn(class_name)
+        symbolic_fn = symbolic_fns.get(class_name)
         # This has to call a function to retain correct references to functions
         is_criterion_fn = 'Criterion' in fn
         if is_criterion_fn:
             cls, backward_cls = _make_function_class_criterion(class_name, update_output,
                                                                update_grad_input, acc_grad_parameters,
-                                                               double_backwards_fn)
+                                                               double_backwards_fn, symbolic_fn)
         else:
             cls, backward_cls = _make_function_class(class_name, update_output,
                                                      update_grad_input, acc_grad_parameters,
-                                                     double_backwards_fn)
+                                                     double_backwards_fn, symbolic_fn)
         scope_dict[class_name] = cls
         scope_dict[backward_cls.__name__] = backward_cls
         if not class_name.startswith('_'):

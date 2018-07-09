@@ -1,110 +1,94 @@
-#include "tensor.h"
+#include "torch/csrc/autograd/functions/tensor.h"
 
-#include "torch/csrc/autograd/variable.h"
+#include "torch/csrc/autograd/function.h"
 #include "torch/csrc/autograd/functions/basic_ops.h"
 #include "torch/csrc/autograd/functions/utils.h"
-#include "torch/csrc/utils/auto_gpu.h"
+#include "torch/csrc/autograd/generated/Functions.h"
+#include "torch/csrc/autograd/variable.h"
+
+#include <ATen/ATen.h>
+
+#include <cstddef>
+#include <memory>
+#include <stdexcept>
+#include <utility>
 
 namespace torch { namespace autograd {
 
-auto Identity::apply(const variable_list& inputs) -> variable_list {
-  return inputs;
-};
-
-auto Clone::apply(const variable_list& inputs) -> variable_list {
-  check_input_variables("Clone", inputs, 1);
-  auto& input = inputs[0]->data;
-  AutoGPU guard(input);
-
-  at::Tensor output = input.clone();
-
-  return wrap_outputs(inputs, as_tensor_list(std::move(output)), [&](FunctionFlags f) {
-    return std::make_shared<Identity>(std::move(f));
-  });
-};
-
-auto Contiguous::apply(const variable_list& inputs) -> variable_list {
-  check_input_variables("Contiguous", inputs, 1);
-  auto& input = inputs[0]->data;
-  AutoGPU guard(input);
-
-  at::Tensor output = input.contiguous();
-
-  return wrap_outputs(inputs, as_tensor_list(std::move(output)), [&](FunctionFlags f) {
-    return std::make_shared<Identity>(std::move(f));
-  });
-};
-
-auto Transpose::apply(const variable_list& inputs) -> variable_list {
-  check_input_variables("Transpose", inputs, 1);
-
-  auto& input = inputs[0]->data;
-  AutoGPU guard(input);
-
-  at::Tensor output = input.transpose(dim1, dim2);
-
-  return wrap_outputs(inputs, as_tensor_list(std::move(output)), [&](FunctionFlags f) {
-    return std::make_shared<Transpose>(dim1, dim2);
-  });
+auto CopyBackwards::apply(const variable_list& grads) -> variable_list {
+  check_input_variables("CopyBackwards", grads, 1);
+  auto& grad = grads[0];
+  variable_list grad_inputs(2);
+  if (should_compute_output(0)) {
+    grad_inputs[0] = at::zeros_like(grad);
+  }
+  if (should_compute_output(1)) {
+    at::DeviceGuard device_guard(src_device);
+    if (grad.is_cuda() && grad.get_device() != src_device) {
+      grad_inputs[1] = src_type->copy(grad);
+    } else {
+      grad_inputs[1] = grad.toType(*src_type);
+    }
+  }
+  return grad_inputs;
 }
 
-auto View::apply(const variable_list& inputs) -> variable_list {
-  check_input_variables("View", inputs, 1);
-
-  auto& input = inputs[0]->data;
-  AutoGPU guard(input);
-
-  at::Tensor output = input.view(size);
-
-  return wrap_outputs(inputs, as_tensor_list(std::move(output)), [&](FunctionFlags f) {
-    return std::make_shared<View>(input.sizes());
-  });
+CopySlices::CopySlices(
+    const Variable& base_var,
+    at::TensorGeometry view_,
+    std::shared_ptr<Function> fn_)
+    : Function(),
+      base(base_var),
+      view(std::move(view_)),
+      fn(std::move(fn_)) {
+  // Take the next_edges of fn as our own, except for index 0 which goes
+  // to base instead of the view.
+  add_input_metadata(base_var.type(), base_var.sizes());
+  const auto num_outputs = fn->num_outputs();
+  next_edges_.reserve(num_outputs);
+  add_next_edge(base_var.gradient_edge());
+  for (size_t i = 1; i < num_outputs; i++) {
+    add_next_edge(fn->next_edge(i));
+  }
 }
 
-auto Expand::apply(const variable_list& inputs) -> variable_list {
-  check_input_variables("Expand", inputs, 1);
+auto CopySlices::apply(const variable_list& inputs) -> variable_list {
+  check_input_variables("CopySlices", inputs, 1);
+  auto& grad = inputs[0];
 
-  auto& input = inputs[0]->data;
-  AutoGPU guard(input);
-
-  at::Tensor output = input.expand(size);
-
-  return wrap_outputs(inputs, as_tensor_list(std::move(output)), [&](FunctionFlags f) {
-    return std::make_shared<Error>("Expand is not differentiable", std::move(f));
-  });
-}
-
-auto Narrow::apply(const variable_list& inputs) -> variable_list {
-  check_input_variables("Narrow", inputs, 1);
-
-  auto& input = inputs[0]->data;
-  AutoGPU guard(input);
-
-  at::Tensor output = input.narrow(dim, start, size);
-
-  return wrap_outputs(inputs, as_tensor_list(std::move(output)), [&](FunctionFlags f) {
-    return std::make_shared<Error>("Narrow is not differentiable", std::move(f));
-  });
-}
-
-auto Cat::apply(const variable_list& inputs) -> variable_list {
-  int num_inputs = inputs.size();
-  if (num_inputs == 0) {
-    throw std::runtime_error("Cat operation expect at least one argument.");
+  if (!fn) {
+    throw std::runtime_error(ERR_BACKWARD_TWICE);
   }
 
-  auto& input = inputs[0]->data;
-  AutoGPU guard(input);
+  auto result = grad.type().tensor(base.sizes(), base.strides());
+  result.copy_(grad);
 
-  std::vector<at::Tensor> tensors(num_inputs);
-  for (int i = 0; i < num_inputs; ++i) {
-    tensors[i] = inputs[i]->data;
+  auto offset = view.storage_offset() - base.storage_offset();
+  auto grad_slice = result.as_strided(view.sizes(), view.strides(), offset);
+
+  // TODO: We clone grad_slice because we modify it below and "fn" might save
+  // it for the backward of res. We might be able to avoid the clone() if
+  // double-backprop is disabled.
+  auto res = (*fn)({ grad_slice.clone() });
+
+  variable_list grad_inputs(num_outputs());
+  for (size_t i = 0; i < res.size(); i++) {
+    if (should_compute_output(i)) {
+      TORCH_ASSERT(res[i].defined());
+      if (i == 0) {
+        grad_slice.copy_(res[i]);
+        grad_inputs[i] = std::move(result);
+      } else {
+        grad_inputs[i] = std::move(res[i]);
+      }
+    }
   }
-  auto output = input.type().cat(tensors, dim);
 
-  return wrap_outputs(inputs, as_tensor_list(output), [&](FunctionFlags f) {
-    return std::make_shared<Error>("Cat is not differentiable", std::move(f));
-  });
+  return grad_inputs;
+}
+
+void CopySlices::release_variables() {
+  fn = nullptr;
 }
 
 }} // namespace torch::autograd

@@ -29,6 +29,7 @@ class VolumetricConvolution(Module):
 
         self.finput = None
         self.fgradInput = None
+        self._input = None
         self._gradOutput = None
 
     def reset(self, stdv=None):
@@ -95,6 +96,7 @@ class VolumetricConvolution(Module):
                 self.weight,
                 self.bias,
                 self.finput,
+                self.fgradInput,
                 self.kT, self.kW, self.kH,
                 self.dT, self.dW, self.dH,
                 self.padT, self.padW, self.padH
@@ -160,6 +162,7 @@ class VolumetricConvolution(Module):
                 self.gradWeight,
                 self.gradBias,
                 self.finput,
+                self.fgradInput,
                 self.kT, self.kW, self.kH,
                 self.dT, self.dW, self.dH,
                 self.padT, self.padW, self.padH,

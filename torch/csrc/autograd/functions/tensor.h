@@ -1,81 +1,36 @@
 #pragma once
 
-#include <Python.h>
-#include <memory>
-
 #include "torch/csrc/autograd/function.h"
 #include "torch/csrc/autograd/variable.h"
 
+#include "ATen/Type.h"
+#include <ATen/TensorGeometry.h>
+#include <ATen/optional.h>
+
+#include <cstdint>
+#include <memory>
+
 namespace torch { namespace autograd {
 
-struct Identity : public Function {
-  Identity(FunctionFlags&& f)
-    : Function(std::move(f)) {};
-
+struct CopyBackwards : public Function {
   virtual variable_list apply(const variable_list& inputs) override;
+
+  at::Type *src_type;
+  int32_t src_device = -1;
 };
 
-struct Clone : public Function {
-  Clone() {}
+// Performs grad[idx] = fn(grad[idx]), but out-of-place. The slicing operation
+// grad[idx] is defined by the relative sizes, strides, and offset of base and
+// view.
+struct CopySlices : public Function {
+  CopySlices(const Variable& base, at::TensorGeometry view, std::shared_ptr<Function> fn);
 
-  virtual variable_list apply(const variable_list& inputs) override;
-};
+  virtual variable_list apply(const variable_list& grads) override;
+  virtual void release_variables() override;
 
-struct Contiguous : public Function {
-  Contiguous() {}
-
-  virtual variable_list apply(const variable_list& inputs) override;
-};
-
-struct Transpose : public Function {
-  Transpose(int64_t dim1, int64_t dim2)
-    : dim1(dim1)
-    , dim2(dim2) {}
-
-  virtual variable_list apply(const variable_list& inputs) override;
-
-  int64_t dim1;
-  int64_t dim2;
-};
-
-struct View : public Function {
-  View(std::vector<int64_t> size)
-    : size(size) {}
-
-  virtual variable_list apply(const variable_list& inputs) override;
-
-  std::vector<int64_t> size;
-};
-
-struct Expand : public Function {
-  Expand(std::vector<int64_t> size)
-    : size(size) {}
-
-  virtual variable_list apply(const variable_list& inputs) override;
-
-  std::vector<int64_t> size;
-};
-
-struct Narrow : public Function {
-  Narrow(int64_t dim, int64_t start, int64_t size)
-    : dim(dim)
-    , start(start)
-    , size(size) {}
-
-  virtual variable_list apply(const variable_list& inputs) override;
-
-  int64_t dim;
-  int64_t start;
-  int64_t size;
-};
-
-struct Cat : public Function {
-  Cat(int64_t dim)
-    : dim(dim) {}
-
-  virtual variable_list apply(const variable_list& inputs) override;
-
-  int64_t dim;
+  at::TensorGeometry base;
+  at::TensorGeometry view;
+  std::shared_ptr<Function> fn;
 };
 
 }}

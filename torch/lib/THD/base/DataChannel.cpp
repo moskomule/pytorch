@@ -5,6 +5,9 @@
 #ifdef WITH_MPI
 #include "data_channels/DataChannelMPI.hpp"
 #endif // WITH_MPI
+#if defined(USE_CUDA) && defined(USE_DISTRIBUTED_NCCL)
+#include "data_channels/DataChannelNccl.hpp"
+#endif // USE_DISTRIBUTED_NCCL
 #include "data_channels/DataChannelTCP.hpp"
 
 #include <algorithm>
@@ -39,6 +42,15 @@ DataChannel* DataChannel::newChannel(THDChannelType type, std::string init_metho
         "try to recompile the THD package with Gloo support"
       );
 
+    case THDChannelNccl:
+#if defined(USE_CUDA) && defined(USE_DISTRIBUTED_NCCL)
+      return new DataChannelNccl(GET_CONFIG);
+#endif
+      throw std::runtime_error(
+        "the distributed NCCL backend is not available; "
+        "try to recompile the THD package with CUDA and NCCL 2+ support"
+      );
+
     default:
       throw std::runtime_error("unsupported data channel type");
   }
@@ -64,7 +76,7 @@ DataChannel::Group::Group(std::vector<rank_type> ranks, rank_type max_rank)
   }
 
   _new2old.reserve(ranks.size());
-  for (std::size_t i = 0; i < ranks.size(); ++i) {
+  for (size_t i = 0; i < ranks.size(); ++i) {
     _new2old.push_back(ranks[i]);
     _old2new.insert({ranks[i], i});
   }

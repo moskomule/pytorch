@@ -1,7 +1,7 @@
 import torch.cuda.comm as comm
 
 
-def replicate(network, devices):
+def replicate(network, devices, detach=False):
     from ._functions import Broadcast
 
     devices = tuple(devices)
@@ -9,7 +9,7 @@ def replicate(network, devices):
 
     params = list(network.parameters())
     param_indices = {param: idx for idx, param in enumerate(params)}
-    param_copies = Broadcast(devices)(*params)
+    param_copies = Broadcast.apply(devices, *params)
     if len(params) > 0:
         param_copies = [param_copies[i:i + len(params)]
                         for i in range(0, len(param_copies), len(params))]
@@ -52,7 +52,8 @@ def replicate(network, devices):
                 param_idx = param_indices[param]
                 for j in range(num_replicas):
                     replica = module_copies[j][i]
-                    replica._parameters[key] = param_copies[j][param_idx]
+                    replica._parameters[key] = param_copies[j][param_idx].detach() \
+                        if detach else param_copies[j][param_idx]
         for key, buf in module._buffers.items():
             if buf is None:
                 for j in range(num_replicas):

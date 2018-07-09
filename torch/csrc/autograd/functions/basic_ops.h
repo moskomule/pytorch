@@ -1,17 +1,18 @@
 #pragma once
 
-#include <Python.h>
-#include <memory>
-#include <string>
-
 #include "torch/csrc/autograd/function.h"
 #include "torch/csrc/autograd/variable.h"
+#include "torch/csrc/autograd/symbolic.h"
+
+#include <memory>
+#include <string>
+#include <vector>
 
 namespace torch { namespace autograd {
 
 struct Error : public Function {
-  Error(std::string msg, FunctionFlags&& flags)
-    : Function(std::move(flags))
+  Error(std::string msg, edge_list&& next_edges)
+    : Function(std::move(next_edges))
     , msg(std::move(msg)) {}
 
   Error(std::string msg)
@@ -33,31 +34,15 @@ struct DelayedError : public Function {
 };
 
 struct GraphRoot : public Function {
-  GraphRoot(function_list functions, variable_list inputs)
-    : outputs(std::move(inputs)) {
-      next_functions = std::move(functions);
-      is_executable = true;
-    };
+  GraphRoot(edge_list functions, variable_list inputs)
+      : Function(std::move(functions)),
+        outputs(std::move(inputs)) {}
 
   virtual variable_list apply(const variable_list& inputs) {
     return outputs;
   }
 
   variable_list outputs;
-};
-
-struct Add : public Function {
-  Add() {}
-
-  virtual variable_list apply(const variable_list& inputs) override;
-};
-
-
-struct AddBackward : public Function {
-  AddBackward(FunctionFlags&& flags)
-    : Function(std::move(flags)) {}
-
-  virtual variable_list apply(const variable_list& gradOutputs) override;
 };
 
 }}
